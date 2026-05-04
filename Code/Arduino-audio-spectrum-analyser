@@ -1,0 +1,203 @@
+#include <arduinoFFT.h>
+#include <MD_MAX72xx.h>
+#include <MD_Parola.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <RTClib.h>
+
+// ── FFT ──────────────────────────────────────────────────────────────────────
+#define SAMPLES 64
+
+// ── LED Matrix ───────────────────────────────────────────────────────────────
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES   4
+#define CLK_PIN   13
+#define DATA_PIN  11
+#define CS_PIN    10
+#define xres 32
+#define yres 8
+
+// ── Display-Muster ────────────────────────────────────────────────────────────
+int MY_ARRAY[]  = {0, 128, 192, 224, 240, 248, 252, 254, 255};
+int MY_MODE_1[] = {0, 128, 192, 224, 240, 248, 252, 254, 255};
+int MY_MODE_2[] = {0, 128,  64,  32,  16,   8,   4,   2,   1};
+int MY_MODE_3[] = {0,   1,   3,   7,  15,  31,  63, 127, 255};
+
+// ── FFT-Buffer ───────────────────────────────────────────────────────────────
+double vReal[SAMPLES];
+double vImag[SAMPLES];
+char   data_avgs[xres];
+int    yvalue;
+int    displaycolumn, displayvalue;
+int    peaks[xres];
+
+// ── Buttons ───────────────────────────────────────────────────────────────────
+const int btnModePin   = 5;   // Visualizer-Modus wechseln
+const int btnSwitchPin = 6;   // Visualizer ↔ Uhr wechseln
+
+// Button 5 (Mode)
+int  btn5PrevState         = LOW;
+unsigned long btn5Debounce = 0;
+
+// Button 6 (Switch)
+int  btn6PrevState         = LOW;
+unsigned long btn6Debounce = 0;
+
+const unsigned long debounceDelay = 50;
+
+int displaymode = 1;
+
+// ── Betriebsmodus ────────────────────────────────────────────────────────────
+enum AppMode { MODE_VISUALIZER, MODE_CLOCK };
+AppMode appMode = MODE_VISUALIZER;
+
+// ── Objekte ──────────────────────────────────────────────────────────────────
+MD_MAX72XX mx     = MD_MAX72XX(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+MD_Parola  parola = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+arduinoFFT FFT    = arduinoFFT();
+RTC_DS1307 rtc;
+
+char timeStr[12];
+
+// ─────────────────────────────────────────────────────────────────────────────
+void setup() {
+  ADCSRA = 0b11100101;
+  ADMUX  = 0b00000000;
+
+  pinMode(btnModePin,   INPUT);
+  pinMode(btnSwitchPin, INPUT);
+
+  Wire.begin();
+  rtc.begin();
+
+  if (!rtc.isrunning()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  mx.begin();
+  mx.control(MD_MAX72XX::INTENSITY, 3);
+  mx.clear();
+
+  parola.begin();
+  parola.setIntensity(3);
+  parola.displayClear();
+
+  delay(50);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void loop() {
+  handleButtonMode();
+  handleButtonSwitch();
+
+  if (appMode == MODE_VISUALIZER) {
+    runVisualizer();
+  } else {
+    runClock();
+  }
+}
+
+// ── Visualizer ───────────────────────────────────────────────────────────────
+void runVisualizer() {
+  for (int i = 0; i < SAMPLES; i++) {
+    while (!(ADCSRA & 0x10));
+    ADCSRA = 0b11110101;
+    int value = ADC - 512;
+    vReal[i] = value / 8;
+    vImag[i] = 0;
+  }
+
+  FFT.Windowing(vReal, SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+  FFT.Compute(vReal, vImag, SAMPLES, FFT_FORWARD);
+  FFT.ComplexToMagnitude(vReal, vImag, SAMPLES);
+
+  int step = (SAMPLES / 2) / xres;
+  int c = 0;
+  for (int i = 0; i < (SAMPLES / 2); i += step) {
+    data_avgs[c] = 0;
+    for (int k = 0; k < step; k++) {
+      data_avgs[c] += vReal[i + k];
+    }
+    data_avgs[c] /= step;
+    c++;
+  }
+
+  for (int i = 0; i < xres; i++) {
+    data_avgs[i] = constrain(data_avgs[i], 0, 80);
+    data_avgs[i] = map(data_avgs[i], 0, 80, 0, yres);
+    yvalue = data_avgs[i];
+
+    peaks[i]--;
+    if (yvalue > peaks[i]) peaks[i] = yvalue;
+    yvalue = peaks[i];
+
+    displayvalue  = MY_ARRAY[yvalue];
+    displaycolumn = 31 - i;
+    mx.setColumn(displaycolumn, displayvalue);
+  }
+}
+
+// ── Uhr ──────────────────────────────────────────────────────────────────────
+void runClock() {
+  DateTime now = rtc.now();
+  sprintf(timeStr, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+
+  if (parola.displayAnimate()) {
+    parola.displayScroll(timeStr, PA_LEFT, PA_SCROLL_LEFT, 60);
+  }
+}
+
+// ── Button 5: Visualizer-Modus wechseln ──────────────────────────────────────
+void handleButtonMode() {
+  int reading = digitalRead(btnModePin);
+
+  if (reading == HIGH && btn5PrevState == LOW &&
+      millis() - btn5Debounce > debounceDelay) {
+    btn5Debounce = millis();
+
+    if (appMode == MODE_VISUALIZER) {
+      cycleDisplayMode();
+    }
+  }
+
+  btn5PrevState = reading;
+}
+
+// ── Button 6: Visualizer ↔ Uhr wechseln ──────────────────────────────────────
+void handleButtonSwitch() {
+  int reading = digitalRead(btnSwitchPin);
+
+  if (reading == HIGH && btn6PrevState == LOW &&
+      millis() - btn6Debounce > debounceDelay) {
+    btn6Debounce = millis();
+    toggleAppMode();
+  }
+
+  btn6PrevState = reading;
+}
+
+// ── App-Modus umschalten ──────────────────────────────────────────────────────
+void toggleAppMode() {
+  if (appMode == MODE_VISUALIZER) {
+    appMode = MODE_CLOCK;
+    mx.clear();
+    parola.displayScroll(timeStr, PA_LEFT, PA_SCROLL_LEFT, 60);
+  } else {
+    appMode = MODE_VISUALIZER;
+    parola.displayClear();
+    mx.clear();
+    for (int i = 0; i < xres; i++) peaks[i] = 0;
+  }
+}
+
+// ── Visualizer-Anzeigemodus wechseln ──────────────────────────────────────────
+void cycleDisplayMode() {
+  displaymode++;
+  if (displaymode > 3) displaymode = 1;
+
+  switch (displaymode) {
+    case 1: for (int i = 0; i <= 8; i++) MY_ARRAY[i] = MY_MODE_1[i]; break;
+    case 2: for (int i = 0; i <= 8; i++) MY_ARRAY[i] = MY_MODE_2[i]; break;
+    case 3: for (int i = 0; i <= 8; i++) MY_ARRAY[i] = MY_MODE_3[i]; break;
+  }
+}
